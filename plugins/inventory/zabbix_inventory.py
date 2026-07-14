@@ -58,6 +58,15 @@ options:
         type: str
         default: 'zabbix_'
         description: Prefix to use for parameters given from Zabbix API.
+    hostnames:
+        type: list
+        elements: str
+        version_added: '1.5.0'
+        description:
+            - Optional list of Jinja2 expressions to construct the Ansible inventory hostname.
+            - The first non-empty rendered value will be used.
+            - When unset, the technical host name from Zabbix (C(host)) is used.
+            - If the rendered hostname is not unique, the plugin will raise an error.
     output:
         type: list
         default: ['extend']
@@ -265,6 +274,34 @@ filter:
 output:
   - name
   - status
+
+
+# HOSTNAME EXAMPLES
+
+# To prefer the visible host name and fall back to the technical host name, use 'hostnames'.
+# In this example, the first non-empty rendered value will be used as the Ansible inventory hostname.
+---
+plugin: "zabbix.zabbix.zabbix_inventory"
+zabbix_api_url: http://your-zabbix.com
+zabbix_user: Admin
+zabbix_password: zabbix
+hostnames:
+  - '{{ name }}'
+  - '{{ host }}'
+
+# To use the first non-empty interface DNS value and fall back to the technical host name,
+# you can use the following example.
+# IMPORTANT: Make sure that the interfaces data is requested from Zabbix API.
+---
+plugin: "zabbix.zabbix.zabbix_inventory"
+zabbix_api_url: http://your-zabbix.com
+zabbix_user: Admin
+zabbix_password: zabbix
+query:
+  selectInterfaces: ['dns']
+hostnames:
+  - '{{ interfaces | map(attribute="dns") | select | first }}'
+  - '{{ host }}'
 
 
 # POSTPROCESSING EXAMPLES
@@ -483,9 +520,71 @@ from ansible_collections.zabbix.zabbix.plugins.module_utils.helper import (
     host_subquery, tags_compare_operators, Zabbix_version, filter_params_depends_on_version)
 from ansible.utils.vars import load_extra_vars
 
+try:
+    from ansible._internal._datatag._tags import TrustedAsTemplate
+except ImportError:
+    # TODO: remove this workaround after ansible 2.18 support will be dropped
+    class TrustedAsTemplate:
+        def __init__(self):
+            self.tag = lambda x: x
+
+TRUST = TrustedAsTemplate()
+
 
 class InventoryModule(BaseInventoryPlugin, Constructable, Cacheable):
     NAME = 'zabbix.zabbix.zabbix_inventory'
+
+    def _get_inventory_hostname(self, host, strict=False):
+        """
+        Build the Ansible inventory hostname for a Zabbix host.
+
+        If the "hostnames" option is provided, it will be evaluated as a list of
+        Jinja2 expressions. The first non-empty value wins. Otherwise, fall back
+        to the technical host name from Zabbix.
+        """
+
+        hostnames = self.args.get('hostnames') or []
+        if not hostnames:
+            return host['host']
+
+        templar_vars = dict(host)
+        prefix = self.args.get('prefix', '')
+        if prefix:
+            for key, value in host.items():
+                templar_vars['{0}{1}'.format(prefix, key)] = value
+
+        errors = []
+        for expr in hostnames:
+            try:
+                stripped = expr.strip()
+                if stripped.startswith('{{') and stripped.endswith('}}'):
+                    stripped = TRUST.tag(stripped[2:-2].strip())
+                rendered = self._compose(stripped, templar_vars)
+            except Exception as exc:
+                if strict:
+                    raise AnsibleParserError(
+                        'Failed to render hostname expression "{0}" for host "{1}": {2}'.format(
+                            expr, host.get('host', '<unknown>'), to_text(exc))
+                    )
+                errors.append((expr, to_text(exc)))
+                continue
+
+            if rendered is None:
+                continue
+
+            candidate = to_text(rendered).strip()
+            if candidate:
+                return candidate
+
+        if errors:
+            raise AnsibleParserError(
+                'Could not template any hostname for host "{0}", errors for each preference: {1}'.format(
+                    host.get('host', '<unknown>'),
+                    ', '.join(['{0}: {1}'.format(pref, err) for pref, err in errors])
+                )
+            )
+
+        return host['host']
 
     def get_absolute_url(self):
         """
@@ -700,7 +799,7 @@ class InventoryModule(BaseInventoryPlugin, Constructable, Cacheable):
 
             # Check type
             for each in self.args['query']:
-                if isinstance(self.args['query'][each], AnsibleUnicode):
+                if isinstance(self.args['query'][each], AnsibleUnicode) or isinstance(self.args['query'][each], str):
                     new_subquery[available_fields[each.lower()]] = [self.args['query'][each].lower()]
                 else:
                     new_subquery[available_fields[each.lower()]] = [e.lower() for e in self.args['query'][each]]
@@ -721,15 +820,19 @@ class InventoryModule(BaseInventoryPlugin, Constructable, Cacheable):
 
             # Status
             if self.args['filter'].get('status') is not None:
-                if (isinstance(self.args['filter']['status'], AnsibleUnicode) is False or
-                        self.args['filter']['status'].lower() not in ['enabled', 'disabled']):
+                expected_statuses = tuple({AnsibleUnicode(x) for x in ['enabled', 'disabled']} | {'enabled', 'disabled'})
+                if ((isinstance(self.args['filter']['status'], AnsibleUnicode) is False and
+                        isinstance(self.args['filter']['status'], str) is False) or
+                        self.args['filter']['status'].lower() not in expected_statuses):
                     raise AnsibleParserError(
                         'Unknown status filter: {0}. Available: enabled, disabled.'.format(self.args['filter']['status']))
 
             # tags_behavior
             if self.args['filter'].get('tags_behavior') is not None:
-                if (isinstance(self.args['filter']['tags_behavior'], AnsibleUnicode) is False or
-                        self.args['filter']['tags_behavior'].lower() not in ['and', 'and/or', 'or']):
+                expected_values = tuple({AnsibleUnicode(x) for x in ['and', 'and/or', 'or']} | {'and', 'and/or', 'or'})
+                if ((isinstance(self.args['filter']['tags_behavior'], AnsibleUnicode) is False and
+                        isinstance(self.args['filter']['tags_behavior'], str) is False) or
+                        self.args['filter']['tags_behavior'].lower() not in expected_values):
                     raise AnsibleParserError(
                         'Unknown tags_behavior filter: {0}. Available: and/or, or.'.format(self.args['filter']['tags_behavior']))
 
@@ -949,6 +1052,34 @@ class InventoryModule(BaseInventoryPlugin, Constructable, Cacheable):
             if 'proxy_groupid' in host:
                 self.zabbix_hosts[i]['proxy_group_name'] = self.ids['proxy_group'].get(host['proxy_groupid'], '')
 
+    def _parse_template_result(self, args):
+        """
+        Parse template results and restore Ansible 2.18 type coercion for 2.19+.
+
+        In Ansible 2.19+, the Templar returns template results with strict typing.
+        Strings resolved from extra vars stay as raw strings even when they contain
+        YAML collection literals. This method:
+        - Parses strings starting with '[' or '{' as YAML into Python objects
+        - Tags all strings for Ansible 2.19's template trust model (no-op on < 2.19)
+        - Applies recursively to dicts and lists
+
+        :param args: A configuration value (str, dict, list, or other)
+        :return: Same object with YAML strings parsed and strings tagged
+        """
+        if isinstance(args, str):
+            stripped = args.strip()
+            if stripped.startswith(('[', '{')):
+                try:
+                    return self.loader.load(stripped)
+                except Exception:
+                    pass
+            return TRUST.tag(args)
+        if isinstance(args, dict):
+            return {k: self._parse_template_result(v) for k, v in args.items()}
+        if isinstance(args, list):
+            return [self._parse_template_result(i) for i in args]
+        return args
+
     def resolve_extra_vars(self):
         """
         The function reads the value of variables from extra-vars.
@@ -962,7 +1093,7 @@ class InventoryModule(BaseInventoryPlugin, Constructable, Cacheable):
         self.templar.available_variables = extra_vars
 
         if extra_vars and self.templar.is_template(self.args) and self.args.get('use_extra_vars') is True:
-            self.args = self.templar.template(self.args)
+            self.args = self._parse_template_result(self.templar.template(self.args))
 
     def preload_data(self):
         """
@@ -1141,24 +1272,37 @@ class InventoryModule(BaseInventoryPlugin, Constructable, Cacheable):
             self.logout()
 
         # Process data from Zabbix API / cached data
+        seen_hostnames = {}
         for host in self.zabbix_hosts:
+            inventory_hostname = self._get_inventory_hostname(host, strict=strict)
+
+            if self.args.get('hostnames'):
+                hostid = host.get('hostid', host.get('host'))
+                existing = seen_hostnames.get(inventory_hostname)
+                if existing is not None and existing != hostid:
+                    raise AnsibleParserError(
+                        'Duplicate inventory hostname "{0}" derived from hostids "{1}" and "{2}". '
+                        'Adjust the "hostnames" expressions to ensure uniqueness.'.format(
+                            inventory_hostname, existing, hostid)
+                    )
+                seen_hostnames[inventory_hostname] = hostid
 
             # Add data about host to inventory
-            self.inventory.add_host(host['host'])
+            self.inventory.add_host(inventory_hostname)
             for each in host:
                 self.inventory.set_variable(
-                    host['host'],
+                    inventory_hostname,
                     '{0}{1}'.format(self.args['prefix'], each),
                     host[each])
 
             # added for compose vars, keyed-groups, and composed groups
             self._set_composite_vars(
                 self.args.get('compose'),
-                self.inventory.get_host(host['host']).get_vars(),
-                host['host'],
+                self.inventory.get_host(inventory_hostname).get_vars(),
+                inventory_hostname,
                 strict=strict)
-            self._add_host_to_composed_groups(groups, dict(), host['host'], strict=strict)
-            self._add_host_to_keyed_groups(keyed_groups, dict(), host['host'], strict=strict)
+            self._add_host_to_composed_groups(groups, dict(), inventory_hostname, strict=strict)
+            self._add_host_to_keyed_groups(keyed_groups, dict(), inventory_hostname, strict=strict)
 
         # Save new data to cache
         if cache_needs_update:
